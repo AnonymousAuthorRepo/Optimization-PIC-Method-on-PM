@@ -1,0 +1,163 @@
+#! /usr/bin/python
+"""
+This file configures the installation of PICSAR in Python mode.
+
+It reads the file Makefile_Forthon.in and creates a new file
+Makefile_Forthon, where the MPI libraries and flags have been
+set to the proper values for the current system.
+
+
+Usage
+-----
+In a terminal, type `./configure` and then `make -f Makefile_Forthon`
+In order to see the optional arguments of configure, type `./configure -h`
+"""
+import os, subprocess, re, sys, argparse
+
+# Get the name of the host
+try:
+    host = os.environ['HOST']
+except KeyError:
+    host = ''
+print('')
+
+# Read compiler and architecture from optional command-line arguments
+parser = argparse.ArgumentParser(
+    description='Automatically create a Makefile_Forthon with the right flags')
+parser.add_argument( '--compiler', choices=['gnu', 'intel'], default='gnu',
+    help='which compiler to use (only used when compiling on Edison/Cori)')
+parser.add_argument( '--architecture', choices=['cpu', 'knl'], default='cpu',
+    help='which architecture to cross-compile for (only used when compiling on Cori)')
+parser.add_argument( '--pxr_spectral_hybrid', choices=['True', 'False'], default='False',
+    help='which picsar mode to use)') 
+parser.add_argument( '--fftw_dir', default="/usr/local",
+    help='fftw base directory path)')
+parser.add_argument( '--p3dfft_dir', default="nop3dfft",
+    help='p3dfft base directory path)')
+
+
+
+is_fftw_enabled  = False
+is_p3dfft_enabled = False
+args = parser.parse_args()
+pxr_spectral_hybrid_ext = ''
+
+parser_file = 'forthon_parser.py'
+if(args.pxr_spectral_hybrid=='True'):
+    p3dfft_lib =" "
+    p3dfft_link = " "
+    is_fftw_enabled = True
+    if(args.p3dfft_dir != "nop3dfft" ):
+      is_p3dfft_enabled = True
+    fftw_lib = args.fftw_dir+'/lib'
+    fftw_link = ' -I ' + args.fftw_dir+'/include'
+    pxr_spectral_hybrid_ext = ' -D FFTW=1 '
+    if(is_p3dfft_enabled):
+      pxr_spectral_hybrid_ext += ' -D P3DFFT=1 '
+      if(args.p3dfft_dir != args.fftw_dir):
+        p3dfft_lib =  args.p3dfft_dir+'/lib'
+        p3dfft_link = '-I '+args.p3dfft_dir+'/include'
+
+    pxr_spectral_hybrid_ext += fftw_link
+    pxr_spectral_hybrid_ext += ' ' + p3dfft_link
+    parser_file = 'forthon_parser_pxr_spectral_hybrid.py'
+    
+# Check if we are on Edison or Cori, at NERSC
+if host.startswith('edison') or host.startswith('cori'):
+    print('Configuring PICSAR on Edison/Cori')
+    comp = 'ftn'
+    libdir_list = []
+    if args.compiler == 'gnu':
+        fcomp = 'gfortran'
+        libs = '-lgomp'
+        if args.architecture == 'knl':
+            fargs = '-O3 -fopenmp -march=knl -ffree-line-length-none -ftree-vectorize -ftree-vectorizer-verbose=0'
+        else:
+            fargs = '-O3 -fopenmp  -ffree-line-length-none -ftree-vectorize -ftree-vectorizer-verbose=0'
+    elif args.compiler == 'intel':
+        fcomp = 'intel'
+        libs = ''
+        if args.architecture == 'knl':
+             fargs = '-O3 -qopenmp  -xMIC-AVX512'
+        else:
+             fargs = '-O3 -qopenmp -xCORE-AVX2 -align array64byte'
+
+    parsed_mpi = True
+
+else:
+    comp = 'mpif90'
+    fcomp = 'gfortran'
+    fargs = '-O3 -fopenmp  -ffree-line-length-none -ftree-vectorize -ftree-vectorizer-verbose=0  '
+    # Parse the result of mpif90 -show
+    parsed_mpi = True   # By default ; errors modify this flag
+    try:
+        info = subprocess.check_output( [ 'mpif90', '-show' ] )
+    except OSError:
+        print('** Failed to detect mpif90 on your system. Is it installed?')
+        parsed_mpi = False
+        libdir_list = []
+        libs = ''
+    else:
+        # Find the library path, using regular expressions
+        libdir_list = re.findall('\s-L(\S+)', info)
+        if libdir_list == []:
+            print('** Failed to detect MPI library location on your system.')
+            parsed_mpi = False
+        else:
+            print('MPI library: %s' %(', '.join(libdir_list)) )
+
+        # Find the proper flags, using regular expressions
+        flag_list = re.findall('\s-l(\S+)', info)
+        if flag_list == []:
+            print('** Failed to detect MPI flags on your system.')
+            parsed_mpi = False
+            libs = ''
+        else:
+            libs = ' '.join([ '-l%s' %flag for flag in flag_list ])
+            libs += ' -lgomp '
+            print('MPI flags: %s' %libs)
+
+fargs = fargs + pxr_spectral_hybrid_ext
+fargs = ' " '+fargs+' " '
+
+if(args.pxr_spectral_hybrid=='True'):
+    if(is_fftw_enabled):
+      libdir_list.append(fftw_lib)
+      libs += ' -lfftw3  -lfftw3_mpi -lfftw3_omp '
+    if(is_p3dfft_enabled):
+      if(p3dfft_lib != " "):
+        libdir_list.append(p3dfft_lib)
+      libs+= ' -lp3dfft '
+
+
+# Read the file Makefile_Forthon.in
+with open('Makefile_Forthon.in') as f:
+    makefile_text = f.read()
+
+# Replace the libraries in the text
+if libdir_list != []:
+    makefile_text = makefile_text.replace(
+    'LIBDIR=', 'LIBDIR=-L%s' %(' -L'.join(libdir_list) ) )
+
+makefile_text = re.sub('\nLIBS=.*', '\nLIBS=%s' %libs, makefile_text)
+makefile_text = re.sub('\nFCOMPEXEC=.*', '\nFCOMPEXEC=%s' %comp, makefile_text)
+makefile_text = re.sub('\nFCOMP=.*', '\nFCOMP=%s' %fcomp, makefile_text)
+makefile_text = re.sub('\nFARGS=.*', '\nFARGS=%s' %fargs, makefile_text)
+makefile_text = re.sub('\nPARSERFILE=.*', '\nPARSERFILE=%s' %parser_file, makefile_text)
+
+
+# Write the new file Makefile_Forthon
+with open('Makefile_Forthon', 'w') as f:
+    f.write( makefile_text )
+
+# Print messages if the configure failed
+if parsed_mpi == False:
+    print('\n** Configure failed.')
+    print('Modify the Makefile_Forthon by hand, to set LIBDIR and LIBS\n')
+    sys.exit(1)
+else:
+    print('\nConfigure succeeded.')
+    print('To compile PICSAR in Python mode, type `make -f Makefile_Forthon`\n')
+    if host.startswith('edison') or host.startswith('cori'):
+        print('(Please make sure your PrgEnv- module is consistant with your ./configure options)')
+    sys.exit(0)
